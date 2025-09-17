@@ -6,6 +6,19 @@ void print_error_message(){
     write(STDERR_FILENO, error_message, strlen(error_message));
     fflush(NULL);
 }
+void split_commands(char *command, char **command_array) {
+    int i = 0;
+    char *token;
+    while ((token = strsep(&command, " \t\n")) != NULL) {
+        if (*token == '\0') {
+            continue;
+        }
+        command_array[i] = token;
+        i++; 
+    }
+    command_array[i] = NULL; // making sure last value is NULL
+}
+
 int main(int argc, char *argv[]){
     if (argc > 2) {
         print_error_message();
@@ -25,9 +38,6 @@ int main(int argc, char *argv[]){
     size_t n = 0;
     ssize_t input;
 
-    char *token; 
-    char *token_array[MAX_TOKEN]; //array contains tokens from user input
-    char *delim = " \t\n"; //delimit set for strsep
     char *search_path[MAX_TOKEN];
     search_path[0] = strdup("/bin/"); //heap-allocated string, default path for not built-in commands
     search_path[1] = strdup("/usr/bin");
@@ -45,119 +55,146 @@ int main(int argc, char *argv[]){
             return(-1);
         }
         
-        //splitting the full command line into tokens
-        char *linecopy = lineptr;
-        int token_count = 0;
-        while ((token = strsep(&linecopy, delim)) != NULL) {
-            if (*token == '\0'){
-                continue; //skip empty tokens
-            }
-            token_array[token_count] = token; //storing current token to the token array
-            token_count++;
+        // remove trailing newline
+        lineptr[strcspn(lineptr, "\n")] = '\0';
+        if (*lineptr == '\0') {
+            continue;
         }
-        if (token_count == 0) {
+
+        //splitting full command by "&"
+        char *linecopy = lineptr;
+        char *commands[MAX_TOKEN];
+        char *cmd;
+        int num_cmd = 0;
+        
+        while((cmd = strsep(&linecopy, "&")) != NULL) {
+            // trim leading spaces
+            while (*cmd == ' ' || *cmd == '\t') {
+                cmd++;
+            }
+            if (*cmd == '\0'){
+                continue;
+            }
+            commands[num_cmd]= strdup(cmd); // storing command to the command array
+            num_cmd++;
+        }
+       
+        if (num_cmd == 0) {
             continue; //empty line, prompt again
         }
-        token_array[token_count] = NULL;  //make sure last item in the token array a NULL terminator
         
-        // built-in commands check
-        if (strcmp(token_array[0], "exit") == 0) { //exit command
-            if (token_count > 1){ //checking if there is more than one argument for exit command
-                print_error_message();
+        pid_t processID[MAX_TOKEN]; // array to store the processes for parallel commands
+    
+        // process each command in commands array 
+        for (int i = 0; i < num_cmd; i++){
+            char *token_array[MAX_TOKEN]; // array contains tokens from splitting
+            split_commands(commands[i], token_array); // split command into tokens
+
+            // built-in command check
+            if (strcmp(token_array[0], "exit") == 0) { //exit command
+                if (token_array[1] != NULL){ // exit command can't take any argument
+                    print_error_message();
+                    continue;
+                }
+                free(lineptr);
+                exit(0);
+            } else if (strcmp(token_array[0], "cd") == 0) { // cd command
+                if (!token_array[1] || token_array[2]) { // cd can take only one argument
+                    print_error_message();
+                    continue;
+                } else {
+                    if (chdir(token_array[1]) != 0) {
+                        print_error_message();
+                    }
+                }
+                continue;
+            } else if (strcmp(token_array[0], "path") == 0) { //path command
+                //free old allocated strings
+                for (int i = 0; i < path_count; i++){
+                    free(search_path[i]);
+                }
+                path_count = 0; // reset path count to 0
+
+                // add new paths from user's input
+                for (int i = 1; token_array[i] != NULL ; i++){
+                    search_path[path_count] = strdup(token_array[i]); //copy tokens from token array to search path
+                    path_count++;
+                }
                 continue;
             }
-            free(lineptr);
-            exit(0);
-        } else if (strcmp(token_array[0], "cd") == 0) { // cd command
-            if (token_count != 2) { // cd can only take one argument
-                print_error_message();
-                continue;
-            } else {
-                if (chdir(token_array[1]) != 0) {
-                    print_error_message();
-                }
-            }
-            continue;
-        } else if (strcmp(token_array[0], "path") == 0) { //path command
-            //free old allocated strings
-            for (int i = 0; i < path_count; i++){
-                free(search_path[i]);
-            }
-            path_count = 0; // reset path count to 0
-
-            // add new paths from user's input
-            for (int i = 1; i < token_count ; i++){
-                search_path[path_count] = strdup(token_array[i]); //copy tokens from token array to search path
-                path_count++;
-            }
-            continue;
-        }
         
-        // 
-        char full_path[256];
-        int found = 0;
-        for (int i = 0; i < path_count ; i++){
-            snprintf(full_path, sizeof(full_path), "%s%s", search_path[i], token_array[0]);
-            if (access(full_path, X_OK) == 0) { //checking if it is executable
-                found = 1;
-                break;
-            }
-        }
-        if (!found) {
-            print_error_message();
-            continue; //back to prompt
-        }
-
-        //checking for redirection mark ">"
-        int rdr_idx = -1;
-        char *filename = NULL;
-        int error = 0; 
-        for (int i = 0; i < token_count; i++){
-            if (strcmp(token_array[i], ">") == 0){
-                if (rdr_idx != -1) { // checking for extra ">"
-                    print_error_message();
-                    error = 1; // flag 
-                }
-                if (i+1 >= token_count || i+2 != token_count) { // detect no filename given or extra arguments after filename
-                    print_error_message(); 
-                    error = 1;
+            // search for executables
+            char full_path[256];
+            int found = 0;
+            for (int i = 0; i < path_count ; i++){
+                snprintf(full_path, sizeof(full_path), "%s%s", search_path[i], token_array[0]);
+                if (access(full_path, X_OK) == 0) { //checking if it is executable
+                    found = 1;
                     break;
                 }
-                rdr_idx = i; // remember index of redirection 
-                filename = token_array[i+1];
-                token_array[rdr_idx] = NULL; // cut off > and filename from token array so execv won't pass them as arguments
-                break; // only support one ">"
             }
-        }
+            if (!found) {
+                print_error_message();
+                continue; //back to prompt
+            }
 
-        if( error ) { // if there is error flag , skip fork() and execv(), go back to prompt
-            continue;
+            //checking for redirection mark ">"
+            int rdr_idx = -1;
+            char *filename = NULL;
+            int error = 0; 
+            for (int i = 0; token_array[i] != NULL; i++){
+                if (strcmp(token_array[i], ">") == 0){
+                    if (rdr_idx != -1) { // checking for extra ">"
+                        print_error_message();
+                        error = 1; // flag 
+                    }
+                    if (!token_array[i+1]  || token_array[i+2]) { // detect no filename given or extra arguments after filename
+                        print_error_message(); 
+                        error = 1;
+                        break;
+                    }
+                    rdr_idx = i; // remember index of redirection 
+                    filename = token_array[i+1];
+                    token_array[rdr_idx] = NULL; // cut off > and filename from token array so execv won't pass them as arguments
+                    break; // only support one ">"
+                }
+            }
+
+            if( error ) { // if there is error flag , skip fork() and execv(), go back to prompt
+                continue;
+            }
+        
+            //using fork(), create a child process
+            int rc = fork();
+            if (rc < 0) {
+                //forked failed
+                print_error_message();
+                exit(1);
+            } else if (rc == 0) {
+                //child, run a new process
+                if (rdr_idx != -1){ // checking for redirection
+                    int file_descriptor = open(filename, O_CREAT|O_WRONLY|O_TRUNC, S_IRWXU);
+                    if (file_descriptor < 0){
+                        print_error_message();
+                        exit(1);
+                    }
+                    dup2(file_descriptor, STDOUT_FILENO); // redirect output stream to the new opened file
+                    close(file_descriptor); // close this descriptor, no need anymore
+                }
+                token_array[0] = full_path;
+                execv(full_path, token_array);
+                print_error_message(); // if execv fails. print error message
+                exit(1);
+            } else {
+                //save each child's process ID to the process array
+                processID[i] = rc;
+            }
+            free(commands[i]);
         }
         
-        //using fork(), create a child process
-        int rc = fork();
-        if (rc < 0) {
-            //forked failed
-            print_error_message();
-            exit(1);
-        } else if (rc == 0) {
-            //child, run a new process
-            if (rdr_idx != -1){ // checking for redirection
-                int file_descriptor = open(filename, O_CREAT|O_WRONLY|O_TRUNC, S_IRWXU);
-                if (file_descriptor < 0){
-                    print_error_message();
-                    exit(1);
-                }
-                dup2(file_descriptor, STDOUT_FILENO); // redirect output stream to the new opened file
-                close(file_descriptor); // close this descriptor, no need anymore
-            }
-            token_array[0] = full_path;
-            execv(full_path, token_array);
-            print_error_message(); // if execv fails. print error message
-            exit(1);
-        } else {
-            //parent , wait for child to finish
-            wait(NULL);
+        //wait for all children to finish
+        for (int i = 0; i < num_cmd; i++){
+            waitpid(processID[i], NULL, 0);
         }
     }
     free(lineptr);
